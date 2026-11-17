@@ -9,6 +9,7 @@ import {
   migrateLegacySessionEndReplay,
   resolveHookSpoolDirectory,
   resolveLegacySessionEndReplayDirectory,
+  retainOldestEntries,
 } from '../../src/shared/hook-spool.js';
 import { logger } from '../../src/utils/logger.js';
 
@@ -64,6 +65,59 @@ describe('HookSpool', () => {
     expect(seen).toEqual(['session_end:session-a', 'session_end:session-b', 'subagent_stop:session-c', 'session_end:session-d']);
     expect(result).toEqual({ drained: 4, retained: 0, quarantined: 0, expired: 0 });
     expect(spoolFiles(spool)).toEqual([]);
+  });
+
+  it('retainOldestEntries keeps the oldest entries and counts the dropped ones', () => {
+    const files = [
+      { filename: 'b-2.json', path: '', entry: { enqueuedAtEpochMs: 20 } },
+      { filename: 'a-1.json', path: '', entry: { enqueuedAtEpochMs: 10 } },
+      { filename: 'c-3.json', path: '', entry: { enqueuedAtEpochMs: 30 } },
+      { filename: 'd-3.json', path: '', entry: { enqueuedAtEpochMs: 30 } },
+    ] as unknown as Parameters<typeof retainOldestEntries>[0];
+
+    expect(retainOldestEntries(files, 3)).toBe(1);
+    expect(files.map(file => file.filename)).toEqual(['a-1.json', 'b-2.json', 'c-3.json']);
+  });
+
+  it('drains only the oldest maxEntries and reports the rest as retained', async () => {
+    const spool = new HookSpool();
+    for (let index = 0; index < 40; index++) {
+      spool.enqueue('session_end', { contentSessionId: `session-${index}`, platformSource: 'claude' }, 1000 + index);
+    }
+
+    const seen: string[] = [];
+    const result = await spool.drain(entry => {
+      seen.push(entry.payload.contentSessionId);
+      return true;
+    }, undefined, { maxEntries: 2 });
+
+    expect(seen).toEqual(['session-0', 'session-1']);
+    expect(result).toEqual({ drained: 2, retained: 38, quarantined: 0, expired: 0 });
+  });
+
+  it('drains through the asynchronous reader, not the blocking one', async () => {
+    const spool = new HookSpool();
+    // The synchronous reader holds the loop for the whole backlog, so the drain
+    // must reach the asynchronous one. A timer probe cannot prove this: whether
+    // a due timer runs first depends on which phase of the loop the readFile
+    // completion lands in.
+    const reader = spool as unknown as {
+      readEntries: (...args: unknown[]) => unknown;
+      readEntriesAsync: (...args: unknown[]) => Promise<unknown>;
+    };
+    const reads: string[] = [];
+    reader.readEntries = () => {
+      throw new Error('drain must not use the synchronous reader');
+    };
+    reader.readEntriesAsync = async () => {
+      reads.push('async');
+      return { files: [], quarantined: 0, omitted: 0 };
+    };
+
+    const result = await spool.drain(() => true);
+
+    expect(reads).toEqual(['async']);
+    expect(result).toEqual({ drained: 0, retained: 0, quarantined: 0, expired: 0 });
   });
 
   it('keeps same-millisecond enqueues from one process in call order', () => {
