@@ -553,6 +553,27 @@ export function validateStory(story) {
   };
 }
 
+/** The same story budgets apply to the saved story and to a checked intermediate draft. */
+export function storyInput(groups, reviews, story) {
+  const update = Number.isFinite(Date.parse(story?.writtenAt ?? ''));
+  const previousNarrativeChars = story?.narrative?.length ?? 0;
+  return { groups, update, narrativeTarget: STORY_NARRATIVE_TARGET, narrativeLimit: STORY_NARRATIVE_MAX, previousNarrativeChars,
+    roomChars: Math.max(0, STORY_NARRATIVE_TARGET - previousNarrativeChars), condenseChars: Math.max(0, previousNarrativeChars - STORY_NARRATIVE_TARGET),
+    previousParts: update ? storyParts(story.narrative) : [], mergeOldestChapters: update ? storyChaptersToMerge(story.narrative) : 0,
+    reviews,
+    // Owner-goals rules are carried by record-story, not rewritten by the story model.
+    previousStory: story && { ...story, preferences: (story.preferences ?? []).filter((preference) => preference?.source !== OWNER_GOALS_LIST) } };
+}
+
+/** The saved facts, not the existence of a private checked-answer cache, make a story due. */
+export function pendingStoryReviews(ledger) {
+  const reviews = Object.values(ledger.progress).sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt))
+    || a.groupId.localeCompare(b.groupId));
+  const writtenAt = Date.parse(ledger.story?.writtenAt ?? '');
+  return Number.isFinite(writtenAt)
+    ? reviews.filter((review) => Date.parse(review.changedAt ?? review.checkedAt) > writtenAt) : reviews;
+}
+
 /** Suggestions still waiting for the owner: the judge's mid-band picks (request-judge.mjs) whose
  * request still exists and whose conversation is not in it yet. */
 export function openSuggestions(ledger) {
@@ -847,7 +868,8 @@ export function refreshNeeds({ dir = LEDGER_DIR, database, now = Date.now(), day
   const queued = focusDue(ledger, focus, localDeviceId, requests);
   const otherHash = otherPassHash(ledger, routerOther(ledger, focus, new Set(queued)), requests);
   const otherChanged = otherHash !== null && otherHash !== focus.otherPassHash;
-  return { due: due.length, ungrouped, goalsStale, unplaced: queued.length, otherChanged, needed: Boolean(due.length || ungrouped || goalsStale || queued.length || otherChanged) };
+  return { due: due.length, ungrouped, goalsStale, unplaced: queued.length, otherChanged,
+    needed: Boolean(due.length || ungrouped || goalsStale || queued.length || otherChanged || pendingStoryReviews(ledger).length) };
 }
 
 function readInput(source) {
@@ -1065,25 +1087,8 @@ export function runCli(argv, { dir = LEDGER_DIR, database = null, now = Date.now
     return print({ recorded: entry.groupId, state: entry.state, percent: entry.percent, readings: entry.readings.length, ...(coercedFields.size ? { coercedFields: [...coercedFields] } : {}) });
   }
   if (command === 'story-input') {
-    const { groups, progress, story } = readLedger(dir);
-    const reviews = Object.values(progress).sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)));
-    // With a previous story, only reviews whose facts changed after it was written.
-    const writtenAt = Date.parse(story?.writtenAt ?? '');
-    const update = Number.isFinite(writtenAt);
-    // An update only ever added to the story until it reached the cap and every update was refused (Oct 24: 11,958 of 12,000),
-    // so the agent is told the budget and the previous story's length up front.
-    // With only the limit and length, an update at 11,836 of 12,000 still added ~1,300 characters and condensed nothing (Oct 24),
-    // so the room left is spelled out as well.
-    // With room counted up to the cap, updates still aimed at the cap and landed over it (Oct 24–26), so the room is
-    // counted up to the target, and a previous story past the target is first condensed back to it, part by part.
-    const previousNarrativeChars = story?.narrative?.length ?? 0;
-    return print({ groups: Object.keys(groups.groups).length, update, narrativeTarget: STORY_NARRATIVE_TARGET, narrativeLimit: STORY_NARRATIVE_MAX, previousNarrativeChars,
-      roomChars: Math.max(0, STORY_NARRATIVE_TARGET - previousNarrativeChars), condenseChars: Math.max(0, previousNarrativeChars - STORY_NARRATIVE_TARGET),
-      previousParts: update ? storyParts(story.narrative) : [], mergeOldestChapters: update ? storyChaptersToMerge(story.narrative) : 0,
-      reviews: update ? reviews.filter((review) => Date.parse(review.changedAt ?? review.checkedAt) > writtenAt) : reviews,
-      // Rules owner-goals put in the story are its own (record-story carries them over): shown here, the story model
-      // would echo them back without their source and when, leaving copies a later owner-goals save cannot replace.
-      previousStory: story && { ...story, preferences: (story.preferences ?? []).filter((preference) => preference?.source !== OWNER_GOALS_LIST) } });
+    const ledger = readLedger(dir);
+    return print(storyInput(Object.keys(ledger.groups.groups).length, pendingStoryReviews(ledger), ledger.story));
   }
   if (command === 'record-story') {
     const validated = validateStory(readInput(args[0] ?? '-'));

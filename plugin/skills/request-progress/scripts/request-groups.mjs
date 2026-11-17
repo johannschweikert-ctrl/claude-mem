@@ -5366,6 +5366,29 @@ function validateStory(story) {
     }))
   };
 }
+function storyInput(groups, reviews, story) {
+  const update = Number.isFinite(Date.parse(story?.writtenAt ?? ""));
+  const previousNarrativeChars = story?.narrative?.length ?? 0;
+  return {
+    groups,
+    update,
+    narrativeTarget: STORY_NARRATIVE_TARGET,
+    narrativeLimit: STORY_NARRATIVE_MAX,
+    previousNarrativeChars,
+    roomChars: Math.max(0, STORY_NARRATIVE_TARGET - previousNarrativeChars),
+    condenseChars: Math.max(0, previousNarrativeChars - STORY_NARRATIVE_TARGET),
+    previousParts: update ? storyParts(story.narrative) : [],
+    mergeOldestChapters: update ? storyChaptersToMerge(story.narrative) : 0,
+    reviews,
+    // Owner-goals rules are carried by record-story, not rewritten by the story model.
+    previousStory: story && { ...story, preferences: (story.preferences ?? []).filter((preference2) => preference2?.source !== OWNER_GOALS_LIST) }
+  };
+}
+function pendingStoryReviews(ledger) {
+  const reviews = Object.values(ledger.progress).sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)) || a.groupId.localeCompare(b.groupId));
+  const writtenAt = Date.parse(ledger.story?.writtenAt ?? "");
+  return Number.isFinite(writtenAt) ? reviews.filter((review) => Date.parse(review.changedAt ?? review.checkedAt) > writtenAt) : reviews;
+}
 function readLedger(dir = LEDGER_DIR) {
   const groups = readJson(join11(dir, "request-groups.json"), emptyGroups());
   const progress = {};
@@ -5573,7 +5596,14 @@ function refreshNeeds({ dir = LEDGER_DIR, database, now = Date.now(), days = 14,
   const queued = focusDue(ledger, focus, localDeviceId2, requests);
   const otherHash = otherPassHash(ledger, routerOther(ledger, focus, new Set(queued)), requests);
   const otherChanged = otherHash !== null && otherHash !== focus.otherPassHash;
-  return { due: due.length, ungrouped, goalsStale, unplaced: queued.length, otherChanged, needed: Boolean(due.length || ungrouped || goalsStale || queued.length || otherChanged) };
+  return {
+    due: due.length,
+    ungrouped,
+    goalsStale,
+    unplaced: queued.length,
+    otherChanged,
+    needed: Boolean(due.length || ungrouped || goalsStale || queued.length || otherChanged || pendingStoryReviews(ledger).length)
+  };
 }
 function readInput(source) {
   return JSON.parse(readFileSync9(source === "-" ? 0 : source, "utf8"));
@@ -5716,26 +5746,8 @@ function runCli(argv, { dir = LEDGER_DIR, database = null, now = Date.now(), pri
     return print2({ recorded: entry.groupId, state: entry.state, percent: entry.percent, readings: entry.readings.length, ...coercedFields.size ? { coercedFields: [...coercedFields] } : {} });
   }
   if (command2 === "story-input") {
-    const { groups, progress, story } = readLedger(dir);
-    const reviews = Object.values(progress).sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)));
-    const writtenAt = Date.parse(story?.writtenAt ?? "");
-    const update = Number.isFinite(writtenAt);
-    const previousNarrativeChars = story?.narrative?.length ?? 0;
-    return print2({
-      groups: Object.keys(groups.groups).length,
-      update,
-      narrativeTarget: STORY_NARRATIVE_TARGET,
-      narrativeLimit: STORY_NARRATIVE_MAX,
-      previousNarrativeChars,
-      roomChars: Math.max(0, STORY_NARRATIVE_TARGET - previousNarrativeChars),
-      condenseChars: Math.max(0, previousNarrativeChars - STORY_NARRATIVE_TARGET),
-      previousParts: update ? storyParts(story.narrative) : [],
-      mergeOldestChapters: update ? storyChaptersToMerge(story.narrative) : 0,
-      reviews: update ? reviews.filter((review) => Date.parse(review.changedAt ?? review.checkedAt) > writtenAt) : reviews,
-      // Rules owner-goals put in the story are its own (record-story carries them over): shown here, the story model
-      // would echo them back without their source and when, leaving copies a later owner-goals save cannot replace.
-      previousStory: story && { ...story, preferences: (story.preferences ?? []).filter((preference2) => preference2?.source !== OWNER_GOALS_LIST) }
-    });
+    const ledger = readLedger(dir);
+    return print2(storyInput(Object.keys(ledger.groups.groups).length, pendingStoryReviews(ledger), ledger.story));
   }
   if (command2 === "record-story") {
     const validated = validateStory(readInput(args[0] ?? "-"));
