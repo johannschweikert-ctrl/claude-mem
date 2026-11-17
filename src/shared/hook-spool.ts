@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'crypto';
 import { existsSync, linkSync, mkdirSync, opendirSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { writeJsonFileAtomic } from './atomic-json.js';
+import { WINDOWS_RENAME_RETRY_CODES, writeJsonFileAtomic } from './atomic-json.js';
 import { ensurePrivateDir, resolveDataDir } from './paths.js';
 import { normalizePlatformSource } from './platform-source.js';
 import { logger } from '../utils/logger.js';
@@ -204,6 +204,9 @@ const CORRUPT_DIRNAME = 'corrupt';
 const SPOOL_ENTRY_MODE = 0o600;
 
 const EXPIRED_DIRNAME = 'expired';
+
+/** Corrupt entries whose transient quarantine failure was already logged by this process. */
+const reportedTransientQuarantineFailures = new Set<string>();
 
 /**
  * A retained entry (session never became known, ingest keeps failing) older
@@ -664,6 +667,7 @@ export class HookSpool {
     try {
       mkdirSync(this.corruptDirectory, { recursive: true });
       renameSync(source, join(this.corruptDirectory, filename));
+      reportedTransientQuarantineFailures.delete(source);
       logger.error('HOOK', 'Quarantined corrupt hook spool entry', {
         file: filename,
         reason,
@@ -672,7 +676,22 @@ export class HookSpool {
       return true;
     } catch (error) {
       // ENOENT: a concurrent drain (another worker process) already moved it.
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      const code = (error as NodeJS.ErrnoException).code ?? '';
+      if (code === 'ENOENT') {
+        reportedTransientQuarantineFailures.delete(source);
+        return false;
+      }
+      // Another process (antivirus, an indexer) holds the file open; a later drain retries it.
+      if (WINDOWS_RENAME_RETRY_CODES.has(code)) {
+        if (!reportedTransientQuarantineFailures.has(source)) {
+          reportedTransientQuarantineFailures.add(source);
+          logger.warn('HOOK', 'Corrupt hook spool entry is locked; leaving it in place and retrying on a later drain', {
+            file: filename,
+            reason,
+          }, error instanceof Error ? error : new Error(String(error)));
+        }
+        return false;
+      }
       logger.error('HOOK', 'Corrupt hook spool entry could not be quarantined; leaving it in place', {
         file: filename,
         reason,
