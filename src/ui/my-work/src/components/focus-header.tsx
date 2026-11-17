@@ -23,6 +23,7 @@ import { navWordIn } from '../../../../services/work-view/nav-words.mjs'
 import { AreaEditDialog, type AreaEdit, type FocusChanges } from './focus-changes'
 import { SharedMark, ShareFocusDialog } from './share-focus'
 import { canShareArea } from '@/live/to-shared-focus'
+import { asksToKeepOrDismiss } from '@/live/to-focus-model'
 
 const requestTitle = (request: Request, t?: (s: string) => string) => request.title ?? (t ? t('New request, title being written') : 'New request, title being written')
 const isReviewed = (request: Request) => request.progress.readings > 0
@@ -202,8 +203,9 @@ function HeaderFrame({ children }: { children: ReactNode }) {
   return <section className="space-y-3 rounded-xl border bg-card p-4 shadow-panel">{children}</section>
 }
 
-// Switching areas decrypts the new name from scramble (EncryptedText), as a fresh request title does; ~0.5s whatever
-// the name's length, so it lands before the eye moves on to the goal. Reduced motion: the plain name.
+// Switching to an area fades its name's real letters in from left to right (EncryptedText), as a fresh request title
+// does; ~0.5s whatever the name's length, so it lands before the eye moves on to the goal. Once per name per page: a
+// name shown before in this page shows plain (EncryptedText keeps that record). Reduced motion: the plain name.
 const DECRYPT_AREA_NAME_IN_MS = 500
 function AreaName({ name }: { name: string }) {
   const reduceMotion = useReducedMotion()
@@ -252,7 +254,7 @@ export function FocusHeader({ area, requests, changes }: { area: FocusArea; requ
         </div>
         {shippedBefore && <p className="text-xs text-review-foreground">{interpolate(t('You asked again on {latestAt}, after the last ship on {shippedBefore}. What shipped doesn’t cover it yet.'), { latestAt: formatPromptDay(area.latestAt!), shippedBefore })}</p>}
         <NotStartedAsks asks={area.asks} />
-        {area.status === 'suggested' && (
+        {asksToKeepOrDismiss(area) && (
           <Req ids={['R16.4']}>
             <div className="flex flex-wrap gap-2 border-t pt-3">
               <Button size="sm" className="h-11 sm:h-8" disabled={changes.saving} onClick={() => changes.apply({ action: 'keep', focusAreaId: area.id })}><CheckIcon />{t('Keep')}</Button>

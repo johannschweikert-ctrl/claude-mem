@@ -96,7 +96,7 @@ function AreaRow({ row, workLoading, incomplete }: { row: FocusOverviewRow; work
   const { area, requests: work, needsYou: waiting, working: moving } = row
   const active = work.filter((request) => !request.closed)
   const next = active.find(needsYou) ?? active.find((request) => request.state === 'working')
-  const nextText = next ? recordedNextStepText(next) : null
+  const nextText = next ? recordedNextStepText(next, t) : null
   return (
     <li className="reveal-area">
       <Collapsible>

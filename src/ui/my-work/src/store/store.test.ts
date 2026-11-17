@@ -10,6 +10,8 @@ import { sampleSource } from '../live/sample-source.ts'
 import type { UsageReport } from '../live/usage.ts'
 import type { RuleSaveResult, WorkDataSource, WorkModel } from '../live/work-data-source.ts'
 import { createBoundStore } from './create-store.ts'
+import { OLDEST_MIGRATED_PREFERENCES_VERSION, PREFERENCES_STORAGE_KEY, PREFERENCES_VERSION } from './preferences.ts'
+import { themeChoiceInUse } from './slices/view-slice.ts'
 import type { StoreEnvironment } from './store-types.ts'
 
 const SAMPLE_MODEL = await sampleSource.loadWorkModel()
@@ -51,17 +53,17 @@ function testStore(options: { href?: string; storage?: ReturnType<typeof memoryS
   let href = options.href ?? 'http://localhost/'
   const urls: { href: string; replace: boolean }[] = []
   const usage: UsageReport[] = []
+  const scrolls = { toTop: 0 }
   const environment: StoreEnvironment = {
     href: () => href,
     writeUrl: (url, replace) => { href = url.href; urls.push({ href: url.href, replace }) },
-    prefersDark: false,
     storage: options.storage ?? memoryStorage(),
     reportsUsage: true,
     sendUsage: (report) => { if (report) usage.push(report) },
-    scrollToTop: () => {},
+    scrollToTop: () => { scrolls.toTop++ },
   }
   const store = createBoundStore(environment)
-  return { store, urls, usage, setHref: (next: string) => { href = next } }
+  return { store, urls, usage, scrolls, setHref: (next: string) => { href = next } }
 }
 
 const settle = () => new Promise((resolve) => setImmediate(resolve))
@@ -177,6 +179,22 @@ describe('reading work', () => {
     assert.equal(store.getState().work.load.state, 'loaded')
   })
 
+  it('Try again answers whether the read worked, and a failed one keeps the shown work', async () => {
+    const { store } = testStore()
+    const { source, reads } = fakeSource()
+    store.getState().startWorkSource(source)
+    reads[0].resolve(withRequests(2))
+    await settle()
+    const failing = store.getState().retryWorkRead()
+    reads[1].reject(new Error('worker busy'))
+    assert.deepEqual(await failing, { read: false, error: 'worker busy' })
+    const load = store.getState().work.load
+    assert.equal(load.state === 'loaded' && load.model.requests.length, 2)
+    const working = store.getState().retryWorkRead()
+    reads[2].resolve(withRequests(3))
+    assert.deepEqual(await working, { read: true })
+  })
+
   it('a stopped source can no longer change the screen', async () => {
     const { store } = testStore()
     const { source, feed, reads } = fakeSource()
@@ -263,9 +281,47 @@ describe('saving work', () => {
     await settle()
     reads[1].reject(new Error('worker restarting'))
     await saving
-    assert.match(store.getState().work.refreshError ?? '', /^Saved\. .*worker restarting/)
+    assert.match(store.getState().work.readAfterSaveFailure ?? '', /worker restarting/)
     const load = store.getState().work.load
     assert.equal(load.state === 'loaded' && load.model.requests.length, 4)
+  })
+
+  it('the next read that succeeds clears a failed read after a save (Try again on the notice)', async () => {
+    const { store } = testStore()
+    const saves: ReturnType<typeof deferred<RuleSaveResult>>[] = []
+    const { source, feed, reads } = ruleSaveSource(saves)
+    store.getState().startWorkSource(source)
+    feed.onModel(withRequests(1))
+    const saving = store.getState().saveRuleChange({ action: 'turn-off', ruleId: 'x' })
+    feed.onModel(withRequests(4))
+    saves[0].resolve({ model: withRequests(3), savedRuleId: null })
+    await settle()
+    reads[1].reject(new Error('worker restarting'))
+    await saving
+    assert.ok(store.getState().work.readAfterSaveFailure)
+    const retrying = store.getState().retryWorkRead()
+    reads[2].resolve(withRequests(4))
+    await retrying
+    assert.equal(store.getState().work.readAfterSaveFailure, null)
+  })
+
+  it('a newer model from the live feed clears the notice that a save’s follow-up read failed', async () => {
+    const { store } = testStore()
+    const saves: ReturnType<typeof deferred<RuleSaveResult>>[] = []
+    const { source, feed, reads } = ruleSaveSource(saves)
+    store.getState().startWorkSource(source)
+    feed.onModel(withRequests(1))
+    const saving = store.getState().saveRuleChange({ action: 'turn-off', ruleId: 'x' })
+    feed.onModel(withRequests(4))
+    saves[0].resolve({ model: withRequests(3), savedRuleId: null })
+    await settle()
+    reads[1].reject(new Error('worker restarting'))
+    await saving
+    assert.ok(store.getState().work.readAfterSaveFailure)
+    feed.onModel(withRequests(5))
+    assert.equal(store.getState().work.readAfterSaveFailure, null, 'the screen shows the worker’s newer work, so it is not behind')
+    const load = store.getState().work.load
+    assert.equal(load.state === 'loaded' && load.model.requests.length, 5)
   })
 
   it('a refusal shows the snapshot the worker refused against, then rejects with the reason', async () => {
@@ -343,6 +399,77 @@ describe('where the person is', () => {
     assert.equal(store.getState().view.openRequest, null, 'it never reopens by itself')
   })
 
+  it('Reply opens the drawer on its reply box; the address is the plain drawer, and a later open is plain (G2)', () => {
+    const { store, urls } = testStore()
+    const [first, second] = LOCAL_MODEL.requests
+    store.getState().openRequestDrawer(first, { reply: true })
+    assert.equal(store.getState().view.openRequest?.replyAsked, true)
+    assert.equal(urls.at(-1)?.href, `http://localhost/?request=${first.id}`)
+    store.getState().openRequestDrawer(second)
+    assert.equal(store.getState().view.openRequest?.replyAsked, undefined)
+  })
+
+  it('the home anchors have their own addresses; asking for one scrolls there, Back does not', () => {
+    const { store, urls, scrolls } = testStore({ href: 'http://localhost/?view=rules' })
+    store.getState().goToHome('all-requests')
+    assert.deepEqual(urls.at(-1), { href: 'http://localhost/#all-requests', replace: false })
+    assert.deepEqual([store.getState().view.section, store.getState().view.homeAnchor, store.getState().view.homeAnchorRequest], ['work', 'all-requests', { anchor: 'all-requests', sequence: 1 }])
+    store.getState().goToHome('focus-areas')
+    assert.equal(urls.at(-1)?.href, 'http://localhost/#focus-areas')
+    assert.deepEqual(store.getState().view.homeAnchorRequest, { anchor: 'focus-areas', sequence: 2 })
+    store.getState().openRequestDrawer(LOCAL_MODEL.requests[0])
+    assert.equal(urls.at(-1)?.href, `http://localhost/?request=${LOCAL_MODEL.requests[0].id}#focus-areas`, 'the drawer opens over the same place')
+    store.getState().goToFocus('fa-sync')
+    assert.equal(urls.at(-1)?.href, 'http://localhost/?focus=fa-sync', 'leaving home drops the anchor')
+    assert.deepEqual([store.getState().view.homeAnchor, store.getState().view.homeAnchorRequest], [null, null], 'and the ask')
+    store.getState().selectFocus(null)
+    assert.deepEqual([urls.at(-1)?.href, scrolls.toTop], ['http://localhost/', 1], 'Focus overview is the top of home')
+    assert.equal(store.getState().view.homeAnchorRequest, null, 'the top of home is not an anchor ask')
+    store.getState().goToHome('focus-areas')
+    assert.deepEqual(store.getState().view.homeAnchorRequest, { anchor: 'focus-areas', sequence: 3 }, 'a new ask never reuses an old number')
+  })
+
+  it('an old "All N" ask does not open the whole board again after the person left home (quality review L5)', () => {
+    const { store } = testStore()
+    store.getState().goToHome('focus-areas')
+    assert.deepEqual(store.getState().view.homeAnchorRequest, { anchor: 'focus-areas', sequence: 1 })
+    store.getState().goToFocus('fa-sync')
+    store.getState().selectFocus(null)
+    assert.equal(store.getState().view.homeAnchorRequest, null, 'Focus overview draws the board with its priority areas')
+    for (const leave of [() => store.getState().goToPage('rules'), () => store.getState().selectFocus({ kind: 'suggested' }), () => store.getState().selectFocus({ kind: 'past-focus' })]) {
+      store.getState().goToHome('focus-areas')
+      leave()
+      assert.equal(store.getState().view.homeAnchorRequest, null)
+    }
+  })
+
+  it('Back or Forward to another place ends an anchor ask; to the same anchor it keeps it', () => {
+    const { store, setHref } = testStore()
+    store.getState().goToHome('focus-areas')
+    const ask = store.getState().view.homeAnchorRequest
+    setHref('http://localhost/#focus-areas')
+    store.getState().showUrl()
+    assert.equal(store.getState().view.homeAnchorRequest, ask, 'the same place: the board keeps every area')
+    for (const elsewhere of ['http://localhost/?focus=fa-sync', 'http://localhost/', 'http://localhost/#all-requests', 'http://localhost/?view=rules']) {
+      store.getState().goToHome('focus-areas')
+      setHref(elsewhere)
+      store.getState().showUrl()
+      assert.equal(store.getState().view.homeAnchorRequest, null, elsewhere)
+    }
+  })
+
+  it('an address with a home anchor scrolls there once; other fragments and other pages carry none', () => {
+    assert.deepEqual(testStore({ href: 'http://localhost/#focus-areas' }).store.getState().view.homeAnchorRequest, { anchor: 'focus-areas', sequence: 1 })
+    assert.equal(testStore({ href: 'http://localhost/#focus-areas' }).store.getState().view.homeAnchor, 'focus-areas')
+    assert.equal(testStore({ href: 'http://localhost/#somewhere' }).store.getState().view.homeAnchor, null)
+    assert.equal(testStore({ href: 'http://localhost/?view=rules#all-requests' }).store.getState().view.homeAnchor, null)
+    assert.equal(testStore({ href: 'http://localhost/?focus=fa-sync#all-requests' }).store.getState().view.homeAnchorRequest, null)
+    const { store, setHref } = testStore({ href: 'http://localhost/?view=rules' })
+    setHref('http://localhost/#all-requests')
+    store.getState().showUrl()
+    assert.deepEqual([store.getState().view.homeAnchor, store.getState().view.homeAnchorRequest], ['all-requests', null], 'Back restores the scroll itself')
+  })
+
   it('opening a focus area closes the drawer', () => {
     const { store } = testStore()
     store.getState().openRequestDrawer(LOCAL_MODEL.requests[0])
@@ -360,21 +487,71 @@ describe('display preferences', () => {
     first.getState().setFocusArtwork('compact')
     first.getState().goToPage('rules')
     const saved = JSON.parse(storage.items.get('claude-mem:my-work:preferences')!)
-    assert.deepEqual(saved.state, { listView: 'list', filter: 'closed', sort: 'attention', focusArtwork: 'compact' })
+    assert.deepEqual(saved.state, { listView: 'list', filter: 'closed', sort: 'attention', focusArtwork: 'compact', theme: 'system' })
     const next = testStore({ storage }).store.getState().view
     assert.deepEqual([next.listView, next.filter, next.focusArtwork, next.section], ['list', 'closed', 'compact', 'work'])
   })
 
   it('leaves unknown saved values at their defaults, drops the team view, and starts the theme from ?theme=', () => {
-    const storage = memoryStorage({ 'claude-mem:my-work:preferences': JSON.stringify({ version: 1, state: { dark: false, listView: 'team', filter: 'mine', sort: 7, focusArtwork: 'animated' } }) })
+    const storage = memoryStorage({ 'claude-mem:my-work:preferences': JSON.stringify({ version: 1, state: { dark: false, theme: 'sepia', listView: 'team', filter: 'mine', sort: 7, focusArtwork: 'animated' } }) })
     const view = testStore({ storage, href: 'http://localhost/?theme=dark' }).store.getState().view
-    assert.deepEqual([view.dark, view.listView, view.filter, view.sort, view.focusArtwork], [true, 'cards', 'all', 'attention', 'full'])
+    assert.deepEqual([themeChoiceInUse(view), view.listView, view.filter, view.sort, view.focusArtwork], ['dark', 'cards', 'all', 'attention', 'compact'])
+    assert.equal(themeChoiceInUse(testStore({ storage }).store.getState().view), 'system', 'an unknown saved theme falls back to the system')
+    assert.equal(themeChoiceInUse(testStore({ storage, href: 'http://localhost/?theme=sepia' }).store.getState().view), 'system', 'an unknown ?theme= is ignored')
+  })
+
+  it('drops preferences saved by a version it cannot migrate, as the pre-paint script does', () => {
+    for (const version of [OLDEST_MIGRATED_PREFERENCES_VERSION - 1, PREFERENCES_VERSION + 1]) {
+      const storage = memoryStorage({ [PREFERENCES_STORAGE_KEY]: JSON.stringify({ version, state: { theme: 'dark', listView: 'list' } }) })
+      const view = testStore({ storage }).store.getState().view
+      assert.deepEqual([view.theme, view.listView], ['system', 'cards'], `version ${version}`)
+    }
+  })
+
+  it('opens Compact for a browser whose version-1 save held the old default, Full; a choice of Full after that stays Full', () => {
+    // 15.19.0 saved 'full' on every visit, as if chosen (persist writes after every state change). Its other choices stay.
+    const storage = memoryStorage({ [PREFERENCES_STORAGE_KEY]: JSON.stringify({ version: 1, state: { listView: 'list', filter: 'working', sort: 'started', focusArtwork: 'full', theme: 'dark' } }) })
+    const first = testStore({ storage }).store
+    const view = first.getState().view
+    assert.deepEqual([view.focusArtwork, view.listView, view.filter, view.sort, view.theme], ['compact', 'list', 'working', 'started', 'dark'])
+    assert.equal(JSON.parse(storage.items.get(PREFERENCES_STORAGE_KEY)!).version, PREFERENCES_VERSION, 'the migrated choices are saved in this version')
+    first.getState().setFocusArtwork('full')
+    for (const reload of [1, 2]) assert.equal(testStore({ storage }).store.getState().view.focusArtwork, 'full', `a chosen Full survives reload ${reload}`)
+    // A version-1 save that chose Off or Compact keeps it: only the old default is not a choice.
+    const off = memoryStorage({ [PREFERENCES_STORAGE_KEY]: JSON.stringify({ version: 1, state: { focusArtwork: 'off' } }) })
+    assert.equal(testStore({ storage: off }).store.getState().view.focusArtwork, 'off')
+  })
+
+  it('G8: the theme is one saved choice; ?theme= wins for the visit, and choosing one in the menu saves it and drops ?theme=', () => {
+    const storage = memoryStorage()
+    const saved = () => JSON.parse(storage.items.get('claude-mem:my-work:preferences')!).state.theme
+    const first = testStore({ storage })
+    assert.equal(themeChoiceInUse(first.store.getState().view), 'system', 'nothing saved: follow the system')
+    first.store.getState().setTheme('dark')
+    assert.equal(saved(), 'dark')
+    assert.deepEqual(first.urls, [], 'no ?theme= in the address, so nothing to rewrite')
+    assert.equal(themeChoiceInUse(testStore({ storage }).store.getState().view), 'dark', 'the saved choice comes back next visit')
+    const visit = testStore({ storage, href: 'http://localhost/?view=rules&theme=light' })
+    assert.equal(themeChoiceInUse(visit.store.getState().view), 'light', 'the address wins over the saved choice')
+    // persist saves the preferences on every state change, so the claim holds only if it survives unrelated ones.
+    visit.store.getState().setFilter('working')
+    visit.store.getState().setShowSpec(true)
+    visit.store.getState().goToPage('work')
+    assert.equal(saved(), 'dark', 'an address theme is never saved, even after other changes are')
+    assert.equal(JSON.parse(storage.items.get('claude-mem:my-work:preferences')!).state.filter, 'working', 'the other change was saved')
+    assert.equal(themeChoiceInUse(visit.store.getState().view), 'light', 'the address still wins for the rest of this visit')
+    assert.equal(themeChoiceInUse(testStore({ storage }).store.getState().view), 'dark', 'the next plain visit has the person’s own choice')
+    visit.store.getState().setTheme('system')
+    assert.deepEqual(visit.urls.at(-1), { href: 'http://localhost/', replace: true })
+    assert.equal(saved(), 'system')
+    assert.equal(themeChoiceInUse(visit.store.getState().view), 'system', 'a choice in the menu replaces the address theme')
   })
 
   it('keeps existing preferences when artwork density is absent and remembers turning artwork off', () => {
     const storage = memoryStorage({ 'claude-mem:my-work:preferences': JSON.stringify({ version: 1, state: { listView: 'list', filter: 'working', sort: 'started' } }) })
     const first = testStore({ storage }).store
-    assert.deepEqual([first.getState().view.listView, first.getState().view.focusArtwork], ['list', 'full'])
+    // No saved density: the board's default, compact rows (page-01); the other saved choices stay.
+    assert.deepEqual([first.getState().view.listView, first.getState().view.focusArtwork], ['list', 'compact'])
     first.getState().setFocusArtwork('off')
     const next = testStore({ storage }).store.getState().view
     assert.deepEqual([next.listView, next.filter, next.sort, next.focusArtwork], ['list', 'working', 'started', 'off'])
